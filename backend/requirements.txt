@@ -1,7 +1,39 @@
+# Django Framework
 django==6.0.4
 djangorestframework==3.17.1
 django-cors-headers==4.9.0
+
+# Channels & WebSocket
 channels==4.3.2
 daphne==4.2.1
+
+# Security
+django-axes==6.0.1
+
+# YOLO & Computer Vision
 ultralytics==8.4.38
 opencv-python==4.13.0.92
+
+# Database (optional - for production)
+# psycopg2-binary==2.9.10  # PostgreSQL
+
+# Redis (optional - for production)
+# channels-redis==4.2.1     # Redis channel layer
+
+# Utilities
+Pillow>=12.2.0
+python-magic==0.4.27  # File type detection (requires libmagic on Linux)
+pygame>=2.6.0  # Audio playback for alerts
+
+# Monitoring & Metrics (optional)
+# django-prometheus==2.3.1   # Prometheus metrics
+# prometheus-client==0.21.1  # Prometheus client
+
+# Testing
+pytest==8.3.5
+pytest-django==4.9.0
+pytest-cov==6.1.1
+pytest-asyncio==0.25.2
+
+# Development
+httpx==0.28.1  # Async HTTP client for testing

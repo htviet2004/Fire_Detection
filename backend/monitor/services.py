@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import ctypes
+import gc
 import logging
 import os
 import sys
@@ -12,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
+import pygame
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.conf import settings
@@ -69,6 +71,7 @@ class DetectionManager:
 
     def __init__(self) -> None:
         self._model: YOLO | None = None
+        self._model_warmed_up = False
         self._capture: cv2.VideoCapture | None = None
         self._capture_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -87,6 +90,10 @@ class DetectionManager:
         self._jpeg_quality = int(getattr(settings, 'STREAM_JPEG_QUALITY', 72))
         self._target_fps = max(1.0, float(getattr(settings, 'STREAM_TARGET_FPS', 20.0)))
         self._input_max_width = int(getattr(settings, 'STREAM_INPUT_MAX_WIDTH', 960))
+        self._frame_skip = max(0, int(getattr(settings, 'STREAM_FRAME_SKIP', 0)))
+        self._use_fp16 = bool(getattr(settings, 'YOLO_USE_FP16', False))
+        self._warmup_iterations = max(1, int(getattr(settings, 'YOLO_WARMUP_ITERATIONS', 3)))
+
         self._fire_keywords = tuple(k.lower() for k in settings.FIRE_LABEL_KEYWORDS)
         self._smoke_keywords = tuple(k.lower() for k in settings.SMOKE_LABEL_KEYWORDS)
         self._event_cooldown = float(settings.EVENT_COOLDOWN_SECONDS)
@@ -97,6 +104,12 @@ class DetectionManager:
         }
         self._last_status_emit = 0.0
 
+        # Performance metrics
+        self._frame_count = 0
+        self._inference_count = 0
+        self._start_time = None
+        self._last_cleanup_time = 0.0
+
         self._latest_frame = self._build_placeholder_frame('Waiting for camera stream...')
         self._status = {
             'state': FireEvent.SAFE,
@@ -104,8 +117,15 @@ class DetectionManager:
             'label': '',
             'confidence': 0.0,
             'message': FireEvent.SAFE,
-            'updated_at': timezone.now().isoformat(),
         }
+        self._alert_sound: pygame.mixer.Sound | None = None
+        self._alert_sound_path = str(settings.BASE_DIR / 'media' / 'alert.mp3')
+        if Path(self._alert_sound_path).exists():
+            try:
+                pygame.mixer.init()
+                self._alert_sound = pygame.mixer.Sound(self._alert_sound_path)
+            except Exception as e:
+                logger.warning(f"Could not load alert sound: {e}")
 
     def _get_model(self) -> YOLO:
         if self._model is None:
@@ -119,7 +139,38 @@ class DetectionManager:
             logger.info("_get_model: initializing YOLO...")
             self._model = YOLO(to_short_path_if_possible(weights_path))
             logger.info("_get_model: YOLO model loaded successfully")
+
+            # Warmup model for faster first inference
+            if not self._model_warmed_up:
+                self._warmup_model()
+
         return self._model
+
+    def _warmup_model(self) -> None:
+        """Warmup YOLO model with dummy inference for faster subsequent inference."""
+        logger.info(f"_warmup_model: starting warmup with {self._warmup_iterations} iterations...")
+        try:
+            warmup_frame = np.zeros((self._imgsz, self._imgsz, 3), dtype=np.uint8)
+            predict_kwargs = {
+                'source': warmup_frame,
+                'conf': 0.25,
+                'iou': 0.45,
+                'imgsz': self._imgsz,
+                'device': self._device,
+                'verbose': False,
+            }
+            if self._use_fp16:
+                predict_kwargs['half'] = True
+
+            for i in range(self._warmup_iterations):
+                self._model.predict(**predict_kwargs)
+                if i == 0:
+                    logger.info("_warmup_model: first warmup iteration complete")
+
+            self._model_warmed_up = True
+            logger.info("_warmup_model: warmup complete")
+        except Exception as e:
+            logger.warning(f"_warmup_model: warmup failed: {e}")
 
     def _is_local_video_source(self) -> bool:
         if isinstance(self._source_value, int):
@@ -162,7 +213,7 @@ class DetectionManager:
             cv2.LINE_AA,
         )
 
-        ok, encoded = cv2.imencode('.jpg', frame)
+        ok, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality])
         return encoded.tobytes() if ok else b''
 
     def _release_capture_locked(self) -> None:
@@ -176,7 +227,6 @@ class DetectionManager:
         if self._capture is None or not self._capture.isOpened():
             self._release_capture_locked()
             return False
-        # Keep capture buffer shallow so stream follows newest frame.
         self._capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return True
 
@@ -190,6 +240,28 @@ class DetectionManager:
         new_size = (self._input_max_width, max(1, int(height * ratio)))
         return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
 
+    def _cleanup_resources(self) -> None:
+        """Periodic cleanup to prevent memory leaks."""
+        current_time = time.time()
+        if current_time - self._last_cleanup_time > 300:  # Every 5 minutes
+            self._last_cleanup_time = current_time
+            gc.collect()
+            logger.debug("_cleanup_resources: garbage collection completed")
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Get performance metrics."""
+        with self._state_lock:
+            uptime = time.time() - self._start_time if self._start_time else 0
+            return {
+                'frame_count': self._frame_count,
+                'inference_count': self._inference_count,
+                'uptime_seconds': round(uptime, 1),
+                'fps': round(self._frame_count / uptime, 2) if uptime > 0 else 0,
+                'inference_fps': round(self._inference_count / uptime, 2) if uptime > 0 else 0,
+                'model_loaded': self._model is not None,
+                'model_warmed_up': self._model_warmed_up,
+            }
+
     def start(self) -> None:
         if sys.is_finalizing():
             return
@@ -199,6 +271,8 @@ class DetectionManager:
                 logger.info("Detection manager already running")
                 return
             self._running = True
+            if self._start_time is None:
+                self._start_time = time.time()
             logger.info("Starting detection manager...")
 
         self._worker = threading.Thread(target=self._run_loop, daemon=True, name='yolo-monitor')
@@ -215,7 +289,8 @@ class DetectionManager:
             self._release_capture_locked()
 
         if worker is not None and worker.is_alive() and worker is not threading.current_thread():
-            worker.join(timeout=1.0)
+            worker.join(timeout=2.0)
+            logger.info("Detection worker thread stopped")
 
     def set_source(self, source: str) -> dict[str, Any]:
         source_text = str(source).strip()
@@ -263,7 +338,6 @@ class DetectionManager:
                 },
             )
         except RuntimeError:
-            # Can happen while the Python interpreter is shutting down.
             return
         except Exception:
             return
@@ -292,23 +366,12 @@ class DetectionManager:
                 smoke_conf = conf
                 smoke_label = label
 
-        if fire_conf >= self._conf:
+        # Always report fire/smoke detection regardless of confidence threshold
+        if fire_conf > 0:
             return FireEvent.FIRE_ALERT, fire_label, fire_conf
-        if smoke_conf >= self._conf:
+        if smoke_conf > 0:
             return FireEvent.SMOKE_DETECTED, smoke_label, smoke_conf
         return FireEvent.SAFE, '', 0.0
-
-    def _draw_status_overlay(self, frame: np.ndarray, state: str, confidence: float) -> None:
-        if state == FireEvent.FIRE_ALERT:
-            color = (0, 0, 255)
-        elif state == FireEvent.SMOKE_DETECTED:
-            color = (0, 165, 255)
-        else:
-            color = (0, 200, 0)
-
-        label = state if state == FireEvent.SAFE else f'{state} ({confidence:.2f})'
-        cv2.rectangle(frame, (0, 0), (frame.shape[1], 48), (22, 22, 22), -1)
-        cv2.putText(frame, label, (12, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2, cv2.LINE_AA)
 
     def _should_log_event(self, state: str) -> bool:
         if state not in (FireEvent.SMOKE_DETECTED, FireEvent.FIRE_ALERT):
@@ -359,12 +422,22 @@ class DetectionManager:
             if event is not None:
                 self._broadcast({'type': 'event_log', 'event': event.to_payload()})
 
+        # Play alert sound when fire/smoke detected (only on state change)
+        if changed and state in (FireEvent.FIRE_ALERT, FireEvent.SMOKE_DETECTED) and self._alert_sound is not None:
+            try:
+                self._alert_sound.play()
+            except Exception as e:
+                logger.warning(f"Could not play alert sound: {e}")
+
     def _run_loop(self) -> None:
         logger.info("_run_loop started")
         last_infer_at = 0.0
         latest_state = FireEvent.SAFE
         latest_label = ''
         latest_confidence = 0.0
+        frame_skip_counter = 0
+        model = None
+
         try:
             while True:
                 with self._state_lock:
@@ -376,10 +449,22 @@ class DetectionManager:
                     logger.info("_run_loop: sys is finalizing, breaking")
                     break
 
+                # Periodic cleanup
+                self._cleanup_resources()
+
+                # Frame skip logic
+                if self._frame_skip > 0:
+                    frame_skip_counter += 1
+                    if frame_skip_counter <= self._frame_skip:
+                        time.sleep(0.01)
+                        continue
+                    frame_skip_counter = 0
+
                 try:
-                    logger.debug("_run_loop: loading model...")
-                    model = self._get_model()
-                    logger.debug("_run_loop: model loaded")
+                    if model is None:
+                        logger.debug("_run_loop: loading model...")
+                        model = self._get_model()
+                        logger.debug("_run_loop: model loaded")
                 except Exception as error:
                     logger.error(f"_run_loop: model load error: {error}", exc_info=True)
                     with self._state_lock:
@@ -398,7 +483,7 @@ class DetectionManager:
                         frame_ok = False
                         frame = None
                     else:
-                        # Drop stale buffered frames to reduce end-to-end latency.
+                        # Drop stale buffered frames
                         for _ in range(2):
                             self._capture.grab()
                         frame_ok, frame = self._capture.read()
@@ -413,22 +498,28 @@ class DetectionManager:
                     continue
 
                 now = time.time()
+                self._frame_count += 1
                 should_infer = (now - last_infer_at) >= self._infer_interval
                 frame_for_processing = self._downscale_for_processing(frame)
 
                 if should_infer:
                     try:
-                        result = model.predict(
-                            source=frame_for_processing,
-                            conf=self._conf,
-                            iou=self._iou,
-                            imgsz=self._imgsz,
-                            device=self._device,
-                            verbose=False,
-                        )[0]
+                        predict_kwargs = {
+                            'source': frame_for_processing,
+                            'conf': self._conf,
+                            'iou': self._iou,
+                            'imgsz': self._imgsz,
+                            'device': self._device,
+                            'verbose': False,
+                        }
+                        if self._use_fp16:
+                            predict_kwargs['half'] = True
+
+                        result = model.predict(**predict_kwargs)[0]
                         latest_state, latest_label, latest_confidence = self._classify_result(result)
                         annotated = result.plot()
                         last_infer_at = now
+                        self._inference_count += 1
                     except Exception:
                         with self._state_lock:
                             self._latest_frame = self._build_placeholder_frame('Inference error, retrying...')
@@ -439,7 +530,6 @@ class DetectionManager:
                     annotated = frame_for_processing.copy()
 
                 state, label, confidence = latest_state, latest_label, latest_confidence
-                self._draw_status_overlay(annotated, state, confidence)
 
                 ok, encoded = cv2.imencode(
                     '.jpg',
@@ -451,10 +541,22 @@ class DetectionManager:
                         self._latest_frame = encoded.tobytes()
 
                 self._push_status(state, label, confidence)
+
+                # Draw alert box on frame
+                if state == FireEvent.FIRE_ALERT:
+                    cv2.rectangle(annotated, (0, 0), (annotated.shape[1], annotated.shape[0]), (0, 0, 255), 8)
+                    cv2.rectangle(annotated, (10, 10), (340, 70), (0, 0, 0), -1)
+                    cv2.putText(annotated, f'FIRE ALERT ({confidence:.2f})', (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+                elif state == FireEvent.SMOKE_DETECTED:
+                    cv2.rectangle(annotated, (0, 0), (annotated.shape[1], annotated.shape[0]), (0, 165, 255), 8)
+                    cv2.rectangle(annotated, (10, 10), (360, 70), (0, 0, 0), -1)
+                    cv2.putText(annotated, f'SMOKE ({confidence:.2f})', (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2, cv2.LINE_AA)
+
                 elapsed = time.time() - now
                 frame_interval = 1.0 / self._target_fps
                 if elapsed < frame_interval:
                     time.sleep(frame_interval - elapsed)
+
         except Exception as e:
             logger.error(f"_run_loop exception: {e}", exc_info=True)
         finally:
@@ -464,7 +566,7 @@ class DetectionManager:
 
             with self._capture_lock:
                 self._release_capture_locked()
-            
+
             logger.info("_run_loop ended")
 
 

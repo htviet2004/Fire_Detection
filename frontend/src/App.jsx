@@ -1,515 +1,358 @@
-import { useEffect, useRef, useState } from 'react'
-import MJPEGStream from './MJPEGStream'
+import { useEffect, useRef, useState, useCallback } from 'react'
 
 const SAFE = 'SAFE'
-const SMOKE = 'SMOKE DETECTED'
-const FIRE = 'FIRE ALERT'
+const SMOKE = 'SMOKE'
+const FIRE = 'FIRE'
 
 const API_ROOT = import.meta.env.VITE_API_ROOT ?? ''
 
 function inferWsUrl() {
-  if (import.meta.env.VITE_WS_URL) {
-    return import.meta.env.VITE_WS_URL
-  }
-
+  if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
   return `${protocol}://${window.location.host}/ws/alerts/`
 }
 
-function formatTimestamp(isoTime) {
-  if (!isoTime) {
-    return '--'
-  }
-
-  const date = new Date(isoTime)
-  if (Number.isNaN(date.getTime())) {
-    return '--'
-  }
-
-  return date.toLocaleString('vi-VN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  })
+function formatTime(iso) {
+  if (!iso) return '--'
+  const d = new Date(iso)
+  if (isNaN(d)) return '--'
+  return d.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
-function App() {
-  const [sourceInput, setSourceInput] = useState('0')
-  const [videoLinkInput, setVideoLinkInput] = useState('')
-  const [selectedVideo, setSelectedVideo] = useState(null)
-  const [activeSource, setActiveSource] = useState('0')
-  const [status, setStatus] = useState({
-    state: SAFE,
-    confidence: 0,
-    label: '',
-    message: SAFE,
-    updated_at: null,
-  })
+export default function App() {
+  const [status, setStatus] = useState({ state: SAFE, confidence: 0, label: '', source: '0', updated_at: null })
   const [events, setEvents] = useState([])
-  const [socketConnected, setSocketConnected] = useState(false)
+  const [connected, setConnected] = useState(false)
+  const [sourceInput, setSourceInput] = useState('0')
+  const [videoLink, setVideoLink] = useState('')
+  const [selectedVideo, setSelectedVideo] = useState(null)
   const [busy, setBusy] = useState(false)
   const [uploadBusy, setUploadBusy] = useState(false)
   const [toast, setToast] = useState('')
   const [streamNonce, setStreamNonce] = useState(0)
   const [streamError, setStreamError] = useState('')
+  const [metrics, setMetrics] = useState(null)
+  const [showMetrics, setShowMetrics] = useState(false)
+  const [isLoading, setIsLoading] = useState(true)
 
+  const retryTimer = useRef(null)
+  const retryCount = useRef(0)
+  const socketRef = useRef(null)
   const reconnectRef = useRef(null)
-  const previousStateRef = useRef(SAFE)
-  const streamRetryRef = useRef(null)
+  const reconnectAttempts = useRef(0)
+  const prevState = useRef(SAFE)
 
   const streamUrl = `${API_ROOT}/api/stream/?v=${streamNonce}`
 
-  const statusClass =
-    status.state === FIRE ? 'state-fire' : status.state === SMOKE ? 'state-smoke' : 'state-safe'
+  const statusClass = status.state === FIRE ? 'fire' : status.state === SMOKE ? 'smoke' : 'safe'
 
-  const refreshEvents = async () => {
-    try {
-      const response = await fetch(`${API_ROOT}/api/events/?limit=120`)
-      if (!response.ok) {
-        return
-      }
-
-      const data = await response.json()
-      if (Array.isArray(data.items)) {
-        setEvents(data.items)
-      }
-    } catch {
-      // Ignore transient polling errors while websocket reconnects.
-    }
-  }
-
-  const refreshStatus = async () => {
-    try {
-      const response = await fetch(`${API_ROOT}/api/status/`)
-      if (!response.ok) {
-        return
-      }
-
-      const data = await response.json()
-      setStatus((prev) => ({ ...prev, ...data }))
-      if (data.source) {
-        setActiveSource(String(data.source))
-        setSourceInput(String(data.source))
-      }
-    } catch {
-      // Keep previous status when API is temporarily unavailable.
-    }
-  }
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      refreshStatus()
-      refreshEvents()
-    }, 0)
-
-    return () => window.clearTimeout(timer)
+  const showToast = useCallback((msg) => {
+    setToast(msg)
   }, [])
 
   useEffect(() => {
-    const wsUrl = inferWsUrl()
-    let socket
-    let isClosed = false
+    if (!toast) return
+    const t = setTimeout(() => setToast(''), 2500)
+    return () => clearTimeout(t)
+  }, [toast])
 
+  useEffect(() => {
+    if (status.state !== SAFE && prevState.current !== status.state) {
+      showToast(`Alert: ${status.state}`)
+    }
+    prevState.current = status.state
+  }, [status.state, showToast])
+
+  // WebSocket
+  useEffect(() => {
     const connect = () => {
-      socket = new WebSocket(wsUrl)
+      const ws = new WebSocket(inferWsUrl())
+      socketRef.current = ws
 
-      socket.onopen = () => {
-        setSocketConnected(true)
+      ws.onopen = () => {
+        setConnected(true)
+        reconnectAttempts.current = 0
       }
 
-      socket.onclose = () => {
-        setSocketConnected(false)
-        if (!isClosed) {
-          reconnectRef.current = window.setTimeout(connect, 1200)
-        }
+      ws.onclose = () => {
+        setConnected(false)
+        socketRef.current = null
+        const delay = Math.min(1000 * Math.pow(2, reconnectAttempts.current), 30000)
+        reconnectAttempts.current++
+        reconnectRef.current = setTimeout(connect, delay)
       }
 
-      socket.onerror = () => {
-        socket.close()
-      }
+      ws.onerror = () => {}
 
-      socket.onmessage = (event) => {
-        let payload
+      ws.onmessage = (e) => {
         try {
-          payload = JSON.parse(event.data)
-        } catch {
-          return
-        }
-
-        if (payload.type === 'snapshot') {
-          if (payload.status) {
-            setStatus(payload.status)
-            if (payload.status.source) {
-              setSourceInput(String(payload.status.source))
-              setActiveSource(String(payload.status.source))
-            }
+          const p = JSON.parse(e.data)
+          switch (p.type) {
+            case 'snapshot':
+              if (p.status) setStatus(p.status)
+              if (Array.isArray(p.events)) setEvents(p.events)
+              setIsLoading(false)
+              break
+            case 'status_update':
+              if (p.status) setStatus(p.status)
+              break
+            case 'event_log':
+              if (p.event) {
+                setEvents(prev => [p.event, ...prev].slice(0, 100))
+              }
+              break
+            case 'metrics':
+              if (p.metrics) setMetrics(p.metrics)
+              break
           }
-          if (Array.isArray(payload.events)) {
-            setEvents(payload.events)
-          }
-          return
-        }
-
-        if (payload.type === 'status_update' && payload.status) {
-          setStatus(payload.status)
-          return
-        }
-
-        if (payload.type === 'event_log' && payload.event) {
-          setEvents((prev) => [payload.event, ...prev].slice(0, 120))
-          setToast(`Realtime alert: ${payload.event.status}`)
-          return
-        }
-
-        if (payload.type === 'source_ack' && payload.status) {
-          setStatus(payload.status)
-          if (payload.status.source) {
-            setActiveSource(String(payload.status.source))
-            setSourceInput(String(payload.status.source))
-          }
-          return
-        }
-
-        if (payload.type === 'source_error') {
-          setToast(payload.error || 'Invalid source')
-        }
+        } catch {}
       }
     }
 
     connect()
 
+    const interval = setInterval(() => {
+      if (socketRef.current?.readyState === WebSocket.OPEN) {
+        socketRef.current.send(JSON.stringify({ type: 'get_metrics' }))
+      }
+    }, 5000)
+
     return () => {
-      isClosed = true
-      if (reconnectRef.current) {
-        window.clearTimeout(reconnectRef.current)
-      }
-      if (socket && socket.readyState <= 1) {
-        socket.close()
-      }
+      clearInterval(interval)
+      if (reconnectRef.current) clearTimeout(reconnectRef.current)
+      socketRef.current?.close()
     }
   }, [])
 
-  useEffect(() => {
-    if (!toast) {
-      return undefined
-    }
-
-    const timer = window.setTimeout(() => setToast(''), 2800)
-    return () => window.clearTimeout(timer)
-  }, [toast])
-
-  useEffect(() => {
-    if (status.state !== SAFE && previousStateRef.current !== status.state) {
-      setToast(`Realtime alert: ${status.state}`)
-    }
-    previousStateRef.current = status.state
-  }, [status.state])
-
-  useEffect(() => {
-    return () => {
-      if (streamRetryRef.current) {
-        window.clearTimeout(streamRetryRef.current)
-      }
+  const handleStreamError = useCallback(() => {
+    setIsLoading(false)
+    retryCount.current++
+    setStreamError(`Reconnecting (${retryCount.current})...`)
+    if (!retryTimer.current) {
+      retryTimer.current = setTimeout(() => {
+        retryTimer.current = null
+        setStreamNonce(n => n + 1)
+      }, 3000)
     }
   }, [])
 
-  const scheduleStreamReconnect = (message) => {
-    setStreamError(message || 'Stream disconnected, reconnecting...')
-    if (streamRetryRef.current) {
-      return
-    }
-
-    streamRetryRef.current = window.setTimeout(() => {
-      streamRetryRef.current = null
-      setStreamNonce((prev) => prev + 1)
-    }, 900)
-  }
-
-  const setSourceByApi = async (nextSource, successMessage) => {
-    if (!nextSource) {
-      throw new Error('Source is required')
-    }
-
-    const response = await fetch(`${API_ROOT}/api/source/`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ source: nextSource }),
-    })
-
-    const body = await response.json().catch(() => ({}))
-    if (!response.ok) {
-      throw new Error(body.error || 'Failed to switch source')
-    }
-
-    if (body.status) {
-      setStatus(body.status)
-      if (body.status.source) {
-        setActiveSource(String(body.status.source))
-      }
-    } else {
-      setActiveSource(nextSource)
-    }
-
-    if (successMessage) {
-      setToast(successMessage)
-    }
+  const handleStreamLoad = useCallback(() => {
+    setIsLoading(false)
     setStreamError('')
-    setStreamNonce((prev) => prev + 1)
-    refreshEvents()
-    return body
-  }
+    retryCount.current = 0
+  }, [])
 
-  const applySource = async (event) => {
-    event.preventDefault()
-    const nextSource = sourceInput.trim()
-    if (!nextSource) {
-      return
-    }
-
+  const setSource = useCallback(async (src, msg) => {
     setBusy(true)
     try {
-      await setSourceByApi(nextSource, `Camera source switched to: ${nextSource}`)
-    } catch (error) {
-      setToast(error.message)
+      const res = await fetch(`${API_ROOT}/api/source/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: src })
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Failed')
+      if (data.status) setStatus(data.status)
+      setStreamNonce(n => n + 1)
+      setStreamError('')
+      showToast(msg || 'Source changed')
+    } catch (e) {
+      showToast(e.message)
     } finally {
       setBusy(false)
     }
+  }, [API_ROOT, showToast])
+
+  const handleApply = (e) => {
+    e.preventDefault()
+    const src = sourceInput.trim()
+    if (src) setSource(src, `Camera: ${src}`)
   }
 
-  const applyVideoLink = async (event) => {
-    event.preventDefault()
-    const nextLink = videoLinkInput.trim()
-    if (!nextLink) {
-      setToast('Please paste a video link first')
-      return
-    }
-
-    setBusy(true)
-    try {
-      await setSourceByApi(nextLink, 'Video link loaded for detection')
-      setSourceInput(nextLink)
-    } catch (error) {
-      setToast(error.message)
-    } finally {
-      setBusy(false)
-    }
+  const handleVideoLink = (e) => {
+    e.preventDefault()
+    const link = videoLink.trim()
+    if (link) setSource(link, 'Video link loaded')
   }
 
-  const applyUploadVideo = async (event) => {
-    event.preventDefault()
+  const handleUpload = async (e) => {
+    e.preventDefault()
     if (!selectedVideo) {
-      setToast('Please choose a video file to upload')
+      showToast('Select a video first')
       return
     }
-
     setUploadBusy(true)
     try {
-      const formData = new FormData()
-      formData.append('video', selectedVideo)
-
-      const response = await fetch(`${API_ROOT}/api/upload-video/`, {
-        method: 'POST',
-        body: formData,
-      })
-
-      const body = await response.json().catch(() => ({}))
-      if (!response.ok) {
-        throw new Error(body.error || 'Failed to upload video')
-      }
-
-      if (body.status) {
-        setStatus(body.status)
-        if (body.status.source) {
-          setActiveSource(String(body.status.source))
-          setSourceInput(String(body.status.source))
-        }
-      }
-
-      setToast(`Uploaded video loaded: ${body.filename || selectedVideo.name}`)
+      const form = new FormData()
+      form.append('video', selectedVideo)
+      const res = await fetch(`${API_ROOT}/api/upload-video/`, { method: 'POST', body: form })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Upload failed')
+      if (data.status) setStatus(data.status)
+      setStreamNonce(n => n + 1)
       setStreamError('')
-      setStreamNonce((prev) => prev + 1)
+      showToast('Video loaded')
       setSelectedVideo(null)
-      const fileInput = document.getElementById('video-upload-input')
-      if (fileInput) {
-        fileInput.value = ''
-      }
-      refreshEvents()
-    } catch (error) {
-      setToast(error.message)
+    } catch (e) {
+      showToast(e.message)
     } finally {
       setUploadBusy(false)
     }
   }
 
   return (
-    <div className="dashboard-root">
-      <div className="noise-layer" aria-hidden="true" />
-
-      <header className="dashboard-header panel card-in">
-        <div>
-          <p className="eyebrow">Fire & Smoke Security Dashboard</p>
-          <h1>Realtime Camera Monitor</h1>
+    <div className="app">
+      <header className="header">
+        <div className="header-left">
+          <div className="logo">F</div>
+          <h1>Fire Monitor</h1>
         </div>
-        <div className="connection-wrap">
-          <span className={`dot ${socketConnected ? 'dot-on' : 'dot-off'}`} />
-          <span>{socketConnected ? 'Realtime Connected' : 'Reconnecting WebSocket...'}</span>
+        <div className="conn-status">
+          <span className={`conn-dot ${connected ? 'on' : 'off'}`} />
+          {connected ? 'Live' : 'Reconnecting'}
         </div>
       </header>
 
-      {status.state !== SAFE && (
-        <div className={`alert-strip ${statusClass}`}>
-          <strong>{status.state}</strong>
-          <span>Action required immediately.</span>
+      {(status.state === FIRE || status.state === SMOKE) && (
+        <div className={`alert-banner ${statusClass}`}>
+          <span>{status.state === FIRE ? 'FIRE DETECTED' : 'SMOKE DETECTED'}</span>
+          <span style={{ opacity: 0.7 }}>— {status.label} ({Number(status.confidence).toFixed(2)})</span>
         </div>
       )}
 
       {toast && <div className="toast">{toast}</div>}
 
-      <main className="dashboard-grid">
-        <section className="panel stream-panel card-in stagger-1">
-          <div className="panel-head">
-            <div>
-              <h2>Live Feed</h2>
-              <p>Bounding boxes are drawn by YOLOv11 on backend stream.</p>
-            </div>
-            <span className={`status-pill ${statusClass}`}>{status.state}</span>
-          </div>
-
-          <div className="stream-shell">
-            <MJPEGStream
-              streamUrl={streamUrl}
-              onError={(msg) => scheduleStreamReconnect(msg)}
-              onRetry={() => scheduleStreamReconnect()}
+      <main className="main">
+        <section className="stream-section">
+          <div className="stream-container">
+            <img
+              src={streamUrl}
+              alt="Stream"
+              className="stream-img"
+              onError={handleStreamError}
+              onLoad={handleStreamLoad}
             />
-            {streamError && <div className="stream-error">{streamError}</div>}
-            <div className="scanline" aria-hidden="true" />
+            {isLoading && (
+              <div className="stream-loading">
+                <div className="spinner" />
+                <span>Connecting...</span>
+              </div>
+            )}
+            <div className={`stream-status ${statusClass}`}>{status.state}</div>
+            {streamError && <div className="stream-error-msg">{streamError}</div>}
           </div>
 
-          <form className="source-form" onSubmit={applySource}>
-            <label htmlFor="source-input">Camera Source (webcam or local path)</label>
-            <div className="source-controls">
-              <input
-                id="source-input"
-                value={sourceInput}
-                onChange={(event) => setSourceInput(event.target.value)}
-                placeholder="0 hoặc rtsp://..."
-                autoComplete="off"
-              />
-              <button disabled={busy} type="submit">
-                {busy ? 'Switching...' : 'Apply'}
-              </button>
-            </div>
-            <p className="source-note">
-              Dùng 0 cho webcam, hoặc đường dẫn file local như D:/videos/fire.mp4
-            </p>
-          </form>
+          <div className="controls">
+            <form className="control-group" onSubmit={handleApply}>
+              <label>Camera</label>
+              <div className="control-row">
+                <input
+                  type="text"
+                  value={sourceInput}
+                  onChange={e => setSourceInput(e.target.value)}
+                  placeholder="0 hoặc đường dẫn..."
+                />
+                <button type="submit" disabled={busy}>Apply</button>
+              </div>
+            </form>
 
-          <form className="source-form" onSubmit={applyVideoLink}>
-            <label htmlFor="video-link-input">Video Link</label>
-            <div className="source-controls">
-              <input
-                id="video-link-input"
-                value={videoLinkInput}
-                onChange={(event) => setVideoLinkInput(event.target.value)}
-                placeholder="https://example.com/fire.mp4 hoặc rtsp://..."
-                autoComplete="off"
-              />
-              <button disabled={busy} type="submit">
-                {busy ? 'Loading...' : 'Load Link'}
-              </button>
-            </div>
-            <p className="source-note">Hỗ trợ direct video URL hoặc RTSP stream URL.</p>
-          </form>
+            <form className="control-group" onSubmit={handleVideoLink}>
+              <label>Video URL</label>
+              <div className="control-row">
+                <input
+                  type="text"
+                  value={videoLink}
+                  onChange={e => setVideoLink(e.target.value)}
+                  placeholder="https://... hoặc rtsp://..."
+                />
+                <button type="submit" disabled={busy}>Load</button>
+              </div>
+            </form>
 
-          <form className="source-form" onSubmit={applyUploadVideo}>
-            <label htmlFor="video-upload-input">Upload Video</label>
-            <div className="upload-controls">
-              <input
-                id="video-upload-input"
-                type="file"
-                accept="video/*"
-                onChange={(event) => setSelectedVideo(event.target.files?.[0] ?? null)}
-              />
-              <button disabled={uploadBusy} type="submit">
-                {uploadBusy ? 'Uploading...' : 'Upload & Detect'}
-              </button>
-            </div>
-            <p className="source-note">
-              {selectedVideo ? `Selected: ${selectedVideo.name}` : 'Chọn file video để backend detect trực tiếp.'}
-            </p>
-          </form>
+            <form className="control-group" onSubmit={handleUpload}>
+              <label>Upload Video</label>
+              <div className="control-row">
+                <input
+                  type="file"
+                  accept="video/*"
+                  onChange={e => setSelectedVideo(e.target.files?.[0] ?? null)}
+                />
+                <button type="submit" disabled={uploadBusy}>
+                  {uploadBusy ? '...' : 'Detect'}
+                </button>
+              </div>
+            </form>
+          </div>
         </section>
 
-        <section className="right-column">
-          <article className={`panel status-card card-in stagger-2 ${statusClass}`}>
-            <h2>System State</h2>
-            <p className="state-value">{status.state}</p>
-            <dl>
-              <div>
+        <aside className="sidebar">
+          <div className="sidebar-section">
+            <h2>Status</h2>
+            <div className={`status-state ${statusClass}`}>{status.state}</div>
+            <dl className="status-grid">
+              <div className="status-row">
                 <dt>Label</dt>
                 <dd>{status.label || '--'}</dd>
               </div>
-              <div>
+              <div className="status-row">
                 <dt>Confidence</dt>
                 <dd>{Number(status.confidence || 0).toFixed(3)}</dd>
               </div>
-              <div>
+              <div className="status-row">
                 <dt>Updated</dt>
-                <dd>{formatTimestamp(status.updated_at)}</dd>
+                <dd>{formatTime(status.updated_at)}</dd>
               </div>
-              <div>
+              <div className="status-row">
                 <dt>Source</dt>
-                <dd>{status.source || activeSource}</dd>
-              </div>
-              <div>
-                <dt>Message</dt>
-                <dd>{status.message || '--'}</dd>
+                <dd>{status.source || '0'}</dd>
               </div>
             </dl>
-          </article>
+          </div>
 
-          <article className="panel log-panel card-in stagger-3">
-            <div className="panel-head">
-              <h2>Fire Event Log</h2>
-              <button className="ghost-btn" onClick={refreshEvents} type="button">
-                Refresh
+          <div className="sidebar-section">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h2 style={{ margin: 0 }}>Events</h2>
+              <button className={`metrics-toggle ${showMetrics ? 'active' : ''}`} onClick={() => setShowMetrics(!showMetrics)}>
+                {showMetrics ? 'Hide' : 'Metrics'}
               </button>
             </div>
 
-            <ul className="event-list">
-              {events.length === 0 && <li className="empty">No smoke/fire events recorded yet.</li>}
+            {showMetrics && metrics && (
+              <div className="metrics-grid">
+                <div className="metric-item">
+                  <div className="metric-label">FPS</div>
+                  <div className="metric-value">{metrics.fps || 0}</div>
+                </div>
+                <div className="metric-item">
+                  <div className="metric-label">Inferences</div>
+                  <div className="metric-value">{metrics.inference_fps || 0}/s</div>
+                </div>
+                <div className="metric-item">
+                  <div className="metric-label">Frames</div>
+                  <div className="metric-value">{(metrics.frame_count || 0).toLocaleString()}</div>
+                </div>
+                <div className="metric-item">
+                  <div className="metric-label">Model</div>
+                  <div className="metric-value">{metrics.model_warmed_up ? 'Ready' : 'Loading'}</div>
+                </div>
+              </div>
+            )}
 
-              {events.map((eventItem) => {
-                const eventClass =
-                  eventItem.status === FIRE
-                    ? 'event-fire'
-                    : eventItem.status === SMOKE
-                      ? 'event-smoke'
-                      : 'event-safe'
-
-                return (
-                  <li key={eventItem.id} className={`event-item ${eventClass}`}>
-                    <div>
-                      <strong>{eventItem.status}</strong>
-                      <p>
-                        label: {eventItem.label || '--'} • conf: {Number(eventItem.confidence || 0).toFixed(3)}
-                      </p>
-                    </div>
-                    <span>{formatTimestamp(eventItem.created_at)}</span>
-                  </li>
-                )
-              })}
-            </ul>
-          </article>
-        </section>
+            <div className="events-list">
+              {events.length === 0 && <div className="empty-state">No events yet</div>}
+              {events.map(ev => (
+                <div key={ev.id} className={`event-item ${ev.status === FIRE ? 'fire' : ev.status === SMOKE ? 'smoke' : 'safe'}`}>
+                  <div className="event-info">
+                    <strong>{ev.status}</strong>
+                    <span>{ev.label || '--'} · {Number(ev.confidence || 0).toFixed(2)}</span>
+                  </div>
+                  <div className="event-time">{formatTime(ev.created_at)}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </aside>
       </main>
     </div>
   )
 }
-
-export default App
